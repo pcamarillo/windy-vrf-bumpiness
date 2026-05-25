@@ -2,7 +2,7 @@ import type { ExternalPluginConfig } from '@windy/interfaces';
 
 const config: ExternalPluginConfig = {
     name: 'windy-plugin-vfr-bumpiness',
-    version: '0.0.3',
+    version: '0.0.5',
     title: 'VFR Bumpiness',
     icon: '🛩️',
     description:
@@ -10,7 +10,7 @@ const config: ExternalPluginConfig = {
     author: 'Pablo Camarillo (pablo.camarillo@gmail.com)',
     repository: 'https://github.com/pcamarillo/windy-vrf-bumpiness',
     desktopUI: 'rhpane',
-    mobileUI: 'fullscreen',
+    mobileUI: 'small',
     routerPath: '/vfr-bumpiness',
     private: false,
     listenToSingleclick: true,

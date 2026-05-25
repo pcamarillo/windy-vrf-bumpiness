@@ -75,6 +75,7 @@ export type WorldGridSpec = {
     viewGridCellCount: number;
     viewGridCols: number;
     viewGridRows: number;
+    samplesPerCell: number;
     zoom: number;
 };
 
@@ -131,6 +132,7 @@ export function buildViewFixedGrid(
     viewEast: number,
     viewGridCellCount: number,
     zoom: number,
+    samplesPerCell = SAMPLES_PER_CELL,
 ): WorldGridSpec {
     const latSpan = Math.max(viewNorth - viewSouth, 1e-6);
     const lonSpan = Math.max(viewEast - viewWest, 1e-6);
@@ -142,6 +144,8 @@ export function buildViewFixedGrid(
     const latStep = latSpan / viewGridRows;
     const lonStep = lonSpan / viewGridCols;
 
+    const sampleCount = Math.max(1, Math.min(SAMPLES_PER_CELL, samplesPerCell));
+
     const points: GridPoint[] = [];
     for (let row = 0; row < viewGridRows; row++) {
         for (let col = 0; col < viewGridCols; col++) {
@@ -150,8 +154,8 @@ export function buildViewFixedGrid(
             const latIdx = Math.floor(centerLat / latStep);
             const lonIdx = Math.floor(centerLon / lonStep);
 
-            for (let sub = 0; sub < SAMPLES_PER_CELL; sub++) {
-                const off = SUBCELL_OFFSETS[sub];
+            for (let sub = 0; sub < sampleCount; sub++) {
+                const off = SUBCELL_OFFSETS[sub] ?? SUBCELL_OFFSETS[0];
                 const lat = centerLat + off.dLat * latStep;
                 const lon = centerLon + off.dLon * lonStep;
                 points.push({ lat, lon, col, row, sub, latIdx, lonIdx });
@@ -172,6 +176,7 @@ export function buildViewFixedGrid(
         viewGridCellCount,
         viewGridCols,
         viewGridRows,
+        samplesPerCell: sampleCount,
         zoom,
     };
 }
@@ -200,7 +205,7 @@ export function gridViewKey(
     timestamp: number,
     spec: WorldGridSpec,
 ): string {
-    return `${model}|${altitudeFeet}|${timestamp}|z${spec.zoom}|n${spec.viewGridCellCount}|${spec.viewGridCols}x${spec.viewGridRows}|${spec.latStep.toFixed(5)},${spec.lonStep.toFixed(5)}|${spec.south.toFixed(3)},${spec.west.toFixed(3)},${spec.north.toFixed(3)},${spec.east.toFixed(3)}`;
+    return `${model}|${altitudeFeet}|${timestamp}|z${spec.zoom}|n${spec.viewGridCellCount}|${spec.viewGridCols}x${spec.viewGridRows}|s${spec.samplesPerCell}|${spec.latStep.toFixed(5)},${spec.lonStep.toFixed(5)}|${spec.south.toFixed(3)},${spec.west.toFixed(3)},${spec.north.toFixed(3)},${spec.east.toFixed(3)}`;
 }
 
 /** Unique grid cells (not raw sample count). */

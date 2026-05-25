@@ -22,8 +22,9 @@ export function worldCellCacheContext(
     lonStep: number,
     zoom: number,
     viewGridCellCount: number,
+    layerKey: string,
 ): string {
-    return `${model}|${timestamp}|${altitudeFeet}|z${zoom}|n${viewGridCellCount}|${latStep.toFixed(5)}|${lonStep.toFixed(5)}`;
+    return `${model}|${timestamp}|${altitudeFeet}|z${zoom}|n${viewGridCellCount}|${latStep.toFixed(5)}|${lonStep.toFixed(5)}|${layerKey}`;
 }
 
 export function ensureWorldCellCacheContext(context: string): void {

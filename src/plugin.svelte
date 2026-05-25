@@ -1,7 +1,7 @@
 <script lang="ts">
     import { onDestroy, onMount } from 'svelte';
     import store from '@windy/store';
-    import { singleclick } from '@windy/singleclick';
+    import { release, singleclick } from '@windy/singleclick';
     import { map } from '@windy/map';
 
     import config from './pluginConfig';
@@ -41,6 +41,25 @@
         type WorldGridSpec,
     } from './bumpinessGrid';
     import { HazardSymbolLayer, type GridCellSample } from './bumpinessMarkers';
+    import {
+        applyLayerOptionsToParams,
+        DEFAULT_LAYER_OPTIONS,
+        isParamLayerEnabled,
+        LAYER_OPTION_META,
+        maskInputsForLayers,
+        needsGridSampling,
+        samplesPerCellForOptions,
+        type BumpinessLayerOptions,
+    } from './bumpinessLayers';
+    import {
+        isMobileDevice,
+        isWindyPickerOpen,
+        offPickerEvents,
+        offPickerMoved,
+        onPickerMoved,
+        onPickerOpenState,
+        openWindyPicker,
+    } from './bumpinessMobile';
     import { BumpinessPickerPin } from './bumpinessPickerPin';
     import { enterBumpinessMapMode, restoreBumpinessMapMode } from './bumpinessMapMode';
     import { forceEndHiddenOverlaySampling } from './bumpinessOverlaySampling';
@@ -62,7 +81,10 @@
 
     let altitudeFeet = 3000;
     let bumpiness = 0;
-    let status = 'Click the map to analyze bumpiness.';
+    let status = isMobileDevice()
+        ? 'Drag the Windy picker on the map, or pan to the map centre.'
+        : 'Click the map to analyze bumpiness.';
+    const mobileMode = isMobileDevice();
     let data: BumpinessInputs = {
         surfaceWindKt: 0,
         gustKt: 0,
@@ -80,6 +102,7 @@
     const models: Products[] = ['ecmwf', 'gfs', 'iconEu', 'iconD2'];
 
     let params: BumpinessParam[] = DEFAULT_BUMPINESS_PARAMS.map(p => ({ ...p }));
+    let layerOptions: BumpinessLayerOptions = { ...DEFAULT_LAYER_OPTIONS };
 
     let viewGridCells = DEFAULT_VIEW_GRID_CELLS;
     let resolvedGridCols = 0;
@@ -102,6 +125,9 @@
     let suppressMapRefresh = 0;
     let lastHeatmapViewKey = '';
     let lastPickerKey = '';
+    let mobileCenterTimer: ReturnType<typeof setTimeout> | null = null;
+    let pickerMovedSubId: number | undefined;
+    let pickerStateSubIds: number[] = [];
     let lastHeatmapCells: GridCellSample[] = [];
     let mapCellBumpiness: number | null = null;
     const symbolLayer = new HazardSymbolLayer();
@@ -117,7 +143,10 @@
         data = inputs;
         mapCellBumpiness = nearestGridBumpiness(lastLocation?.lat, lastLocation?.lon);
         if (lastLocation) {
-            const score = computeBumpiness(inputs, params);
+            const score = computeBumpiness(
+                maskInputsForLayers(inputs, layerOptions),
+                applyLayerOptionsToParams(params, layerOptions),
+            );
             pickerPin.update(lastLocation.lat, lastLocation.lon, score);
         }
     }
@@ -131,6 +160,7 @@
             bounds.getEast(),
             viewGridCells,
             map.getZoom(),
+            samplesPerCellForOptions(layerOptions),
         );
     }
 
@@ -156,7 +186,10 @@
             );
             const cached = getWorldCell(latIdx, lonIdx);
             if (cached) {
-                return computeBumpiness(cached.inputs, params);
+                return computeBumpiness(
+                    maskInputsForLayers(cached.inputs, layerOptions),
+                    applyLayerOptionsToParams(params, layerOptions),
+                );
             }
         }
         if (!lastHeatmapCells.length) {
@@ -170,7 +203,10 @@
             const dist = dLat * dLat + dLon * dLon;
             if (dist < bestDist) {
                 bestDist = dist;
-                best = computeBumpiness(inputs, params);
+                best = computeBumpiness(
+                    maskInputsForLayers(inputs, layerOptions),
+                    applyLayerOptionsToParams(params, layerOptions),
+                );
             }
         }
         const matchLat = activeLatStep > 0 ? activeLatStep : displayLatStep;
@@ -204,6 +240,17 @@
         }
     }
 
+    function onLayersChanged() {
+        layerOptions = { ...layerOptions };
+        clearForecastCache();
+        clearWorldCellCache();
+        lastHeatmapViewKey = '';
+        if (lastLocation) {
+            void analyzePoint(lastLocation.lat, lastLocation.lon, false);
+        }
+        scheduleHeatmapUpdate();
+    }
+
     function onGridConfigChanged() {
         clearForecastCache();
         clearWorldCellCache();
@@ -225,7 +272,7 @@
                     lon,
                     altitudeFeet,
                     pluginName,
-                    { useOverlays: true },
+                    { useOverlays: true, layerOptions },
                 ),
                 POINT_ANALYSIS_TIMEOUT_MS,
                 'Point forecast',
@@ -299,6 +346,35 @@
         scheduleHeatmapUpdate();
     }
 
+    /** When the map is panned on mobile, read bumpiness at the map centre (crosshair). */
+    function scheduleMobileCenterAnalysis() {
+        if (!mobileMode || isWindyPickerOpen()) {
+            return;
+        }
+        if (mobileCenterTimer) {
+            clearTimeout(mobileCenterTimer);
+        }
+        mobileCenterTimer = setTimeout(() => {
+            mobileCenterTimer = null;
+            const center = map.getCenter();
+            handlePickerLocation({ lat: center.lat, lon: center.lng });
+        }, 400);
+    }
+
+    function resolveInitialLocation(): LatLon {
+        const fromPicker = store.get('pickerLocation');
+        if (fromPicker) {
+            return fromPicker;
+        }
+        const center = map.getCenter();
+        return { lat: center.lat, lon: center.lng };
+    }
+
+    function enableMobilePicker(loc: LatLon) {
+        release(pluginName, 'high');
+        openWindyPicker(loc.lat, loc.lon);
+    }
+
     function syncAltitudeLevel() {
         store.set('level', feetToPressureLevel(altitudeFeet));
     }
@@ -328,41 +404,69 @@
         activeLonStep = gridSpec.lonStep;
         applyGridSpecMetrics(gridSpec);
 
-        const paintCells = sample.cells.map(cell => ({
-            lat: cell.point.lat,
-            lon: cell.point.lon,
-            score: computeBumpiness(cell.inputs, params),
-        }));
-        const dataUrl = buildSmoothHeatmapDataUrl(
-            paintCells,
-            gridSpec.south,
-            gridSpec.west,
-            gridSpec.north,
-            gridSpec.east,
-            gridSpec.latStep,
-            gridSpec.lonStep,
-        );
-        if (!dataUrl) {
-            return false;
+        lastHeatmapCells = sample.cells;
+
+        if (!layerOptions.heatmap) {
+            if (heatmapOverlay) {
+                map.removeLayer(heatmapOverlay);
+                heatmapOverlay = null;
+            }
+        } else {
+            const effectiveParams = applyLayerOptionsToParams(params, layerOptions);
+            const paintCells = sample.cells.map(cell => ({
+                lat: cell.point.lat,
+                lon: cell.point.lon,
+                score: computeBumpiness(
+                    maskInputsForLayers(cell.inputs, layerOptions),
+                    effectiveParams,
+                ),
+            }));
+            const dataUrl = buildSmoothHeatmapDataUrl(
+                paintCells,
+                gridSpec.south,
+                gridSpec.west,
+                gridSpec.north,
+                gridSpec.east,
+                gridSpec.latStep,
+                gridSpec.lonStep,
+            );
+            if (!dataUrl) {
+                return false;
+            }
+
+            const leafletBounds: L.LatLngBoundsExpression = [
+                [gridSpec.south, gridSpec.west],
+                [gridSpec.north, gridSpec.east],
+            ];
+
+            const pane = ensureBumpinessPane(map);
+            if (heatmapOverlay) {
+                map.removeLayer(heatmapOverlay);
+            }
+            heatmapOverlay = L.imageOverlay(dataUrl, leafletBounds, {
+                opacity: 0.72,
+                interactive: false,
+                className: 'vfr-bumpiness-overlay',
+                pane,
+            });
+            heatmapOverlay.addTo(map);
+            raiseBumpinessOverlay(heatmapOverlay, map);
         }
 
-        const leafletBounds: L.LatLngBoundsExpression = [
-            [gridSpec.south, gridSpec.west],
-            [gridSpec.north, gridSpec.east],
-        ];
+        if (layerOptions.hazardSymbols) {
+            symbolLayer.render(
+                sample.cells.map(cell => ({
+                    ...cell,
+                    inputs: maskInputsForLayers(cell.inputs, layerOptions),
+                    hazardInputs: maskInputsForLayers(cell.hazardInputs, layerOptions),
+                })),
+                applyLayerOptionsToParams(params, layerOptions),
+                altitudeFeet,
+            );
+        } else {
+            symbolLayer.clear();
+        }
 
-        const pane = ensureBumpinessPane(map);
-        removeHeatmapOverlay();
-        heatmapOverlay = L.imageOverlay(dataUrl, leafletBounds, {
-            opacity: 0.72,
-            interactive: false,
-            className: 'vfr-bumpiness-overlay',
-            pane,
-        });
-        heatmapOverlay.addTo(map);
-        raiseBumpinessOverlay(heatmapOverlay, map);
-        lastHeatmapCells = sample.cells;
-        symbolLayer.render(sample.cells, params, altitudeFeet);
         if (lastLocation) {
             mapCellBumpiness = nearestGridBumpiness(lastLocation.lat, lastLocation.lon);
         }
@@ -379,12 +483,21 @@
         if (heatmapBusy) {
             return;
         }
+        if (!needsGridSampling(layerOptions)) {
+            removeHeatmapOverlay();
+            lastHeatmapCells = [];
+            lastHeatmapViewKey = viewKeyForHeatmap();
+            status = 'Map layers off — click for point analysis.';
+            return;
+        }
         heatmapBusy = true;
         suppressMapRefresh++;
         const token = ++heatmapToken;
         const model = normalizeProduct(selectedModel);
         const viewKey = viewKeyForHeatmap();
-        status = 'Loading bumpiness (wind & shear)…';
+        status = layerOptions.cape || layerOptions.cclThermals
+            ? 'Loading bumpiness (wind & overlays)…'
+            : 'Loading bumpiness (wind & shear)…';
 
         try {
             const gridSpec = buildGridSpecFromMap();
@@ -399,12 +512,16 @@
                 params,
                 18,
                 {
+                    layerOptions,
                     onQuickReady: quick => {
                         if (token !== heatmapToken) {
                             return;
                         }
                         if (paintHeatmapSample(quick, gridSpec)) {
-                            status = 'Map preview — loading CAPE/CCL in background…';
+                            status =
+                                layerOptions.cape || layerOptions.cclThermals
+                                    ? 'Map preview — loading overlays in background…'
+                                    : 'Map preview ready';
                         }
                     },
                 },
@@ -455,13 +572,12 @@
         ensureBumpinessPane(map);
         syncAltitudeLevel();
         refreshResolutionEstimate();
-        const loc = store.get('pickerLocation');
-        if (loc) {
-            lastPickerKey = locationKey(loc.lat, loc.lon);
-            void analyzePoint(loc.lat, loc.lon, true);
-        } else {
-            scheduleHeatmapUpdate();
+        const loc = resolveInitialLocation();
+        lastPickerKey = locationKey(loc.lat, loc.lon);
+        if (mobileMode) {
+            enableMobilePicker(loc);
         }
+        void analyzePoint(loc.lat, loc.lon, true);
     };
 
     export const onclose = () => {
@@ -483,6 +599,17 @@
             }
         });
 
+        pickerMovedSubId = onPickerMoved(loc => {
+            handlePickerLocation(loc);
+        });
+
+        pickerStateSubIds = onPickerOpenState(
+            () => {},
+            () => {
+                scheduleMobileCenterAnalysis();
+            },
+        );
+
         const timestampSubId = store.on('timestamp', () => {
             clearForecastCache();
             clearWorldCellCache();
@@ -493,8 +620,18 @@
             scheduleHeatmapUpdate();
         });
 
-        singleclick.on(pluginName, handleSingleClick);
-        map.on('moveend', onMapViewChanged);
+        if (mobileMode) {
+            release(pluginName, 'high');
+        } else {
+            singleclick.on(pluginName, handleSingleClick);
+        }
+
+        const onMapMoveEnd = () => {
+            onMapViewChanged();
+            scheduleMobileCenterAnalysis();
+        };
+
+        map.on('moveend', onMapMoveEnd);
         map.on('zoomend', onMapViewChanged);
 
         if (!lastLocation) {
@@ -502,10 +639,17 @@
         }
 
         return () => {
+            if (mobileCenterTimer) {
+                clearTimeout(mobileCenterTimer);
+            }
             store.off(pickerSubId);
+            offPickerMoved(pickerMovedSubId);
+            offPickerEvents(pickerStateSubIds);
             store.off(timestampSubId);
-            singleclick.off(pluginName, handleSingleClick);
-            map.off('moveend', onMapViewChanged);
+            if (!mobileMode) {
+                singleclick.off(pluginName, handleSingleClick);
+            }
+            map.off('moveend', onMapMoveEnd);
             map.off('zoomend', onMapViewChanged);
         };
     });
@@ -532,13 +676,23 @@
         }
     }
 
-    $: bumpiness = computeBumpiness(data, params);
-    $: subscores = factorSubscores(data);
-    $: hazardDetail = getHazardCauseDetail(data, params, altitudeFeet);
+    $: effectiveParams = applyLayerOptionsToParams(params, layerOptions);
+    $: maskedData = maskInputsForLayers(data, layerOptions);
+    $: bumpiness = computeBumpiness(maskedData, effectiveParams);
+    $: subscores = factorSubscores(maskedData);
+    $: hazardDetail = getHazardCauseDetail(maskedData, effectiveParams, altitudeFeet);
 </script>
 
 <div class="plugin__content">
     <h3>{title}</h3>
+
+    {#if mobileMode}
+        <p class="mobile-hint">
+            Map stays visible above. Use Windy&apos;s <b>picker</b> (tap the map or drag the
+            crosshair) — bumpiness updates in the panel and on the map badge. Panning also
+            reads the map centre.
+        </p>
+    {/if}
 
     <p class="intro">
         Detects <b>bumpiness (perceived turbulence)</b> for <b>VFR</b> light aircraft
@@ -586,15 +740,27 @@
     </div>
 
     <div class="breakdown">
-        <div>
-            Wind: {data.surfaceWindKt.toFixed(0)} kt · Gust: {data.gustKt.toFixed(0)} kt
-            <span>(Δ {data.deltaV.toFixed(0)} kt, weight {Math.round(subscores.deltaV * 100)}%)</span>
-        </div>
-        <div>Shear: {(data.shear).toFixed(0)} kt <span>({Math.round(subscores.shear * 100)}%)</span></div>
-        <div>CAPE: {(data.cape).toFixed(0)} J/kg <span>({Math.round(subscores.cape * 100)}%)</span></div>
-        <div>CCL/Thermals: {(data.cclM).toFixed(0)} m <span>({Math.round(subscores.cclM * 100)}%)</span></div>
-        <div>Rain: {(data.rainMm).toFixed(1)} mm/h</div>
-        <div>Turb: {(data.vvel).toFixed(1)} <span>({Math.round(subscores.vvel * 100)}%)</span></div>
+        {#if layerOptions.gusts}
+            <div>
+                Wind: {data.surfaceWindKt.toFixed(0)} kt · Gust: {data.gustKt.toFixed(0)} kt
+                <span>(Δ {data.deltaV.toFixed(0)} kt, weight {Math.round(subscores.deltaV * 100)}%)</span>
+            </div>
+        {/if}
+        {#if layerOptions.shear}
+            <div>Shear: {data.shear.toFixed(0)} kt <span>({Math.round(subscores.shear * 100)}%)</span></div>
+        {/if}
+        {#if layerOptions.cape}
+            <div>CAPE: {(data.cape).toFixed(0)} J/kg <span>({Math.round(subscores.cape * 100)}%)</span></div>
+        {/if}
+        {#if layerOptions.cclThermals}
+            <div>CCL/Thermals: {(data.cclM).toFixed(0)} m <span>({Math.round(subscores.cclM * 100)}%)</span></div>
+        {/if}
+        {#if layerOptions.rainConvection}
+            <div>Rain: {(data.rainMm).toFixed(1)} mm/h</div>
+        {/if}
+        {#if layerOptions.turbulence}
+            <div>Turb: {(data.vvel).toFixed(1)} <span>({Math.round(subscores.vvel * 100)}%)</span></div>
+        {/if}
     </div>
 
     <p class="status">{status}</p>
@@ -641,6 +807,24 @@
             </select>
         </div>
 
+        <h4 class="settings-heading">Layers &amp; factors</h4>
+        <p class="hint layer-hint">
+            Uncheck slow layers to load faster. Defaults suit Iberian VFR (CAPE overlay &amp; model turb off).
+        </p>
+        <div class="layer-options">
+            {#each LAYER_OPTION_META as opt}
+                <label class="layer-check" class:layer-check--slow={opt.slow}>
+                    <input type="checkbox" bind:checked={layerOptions[opt.key]} on:change={onLayersChanged} />
+                    <span class="layer-check__text">
+                        <b>{opt.label}</b>
+                        {#if opt.slow}<small class="layer-slow-tag">slow</small>{/if}
+                        <small>{opt.desc}</small>
+                    </span>
+                </label>
+            {/each}
+        </div>
+
+        <h4 class="settings-heading">Grid</h4>
         <div class="row">
             <label>
                 Grid cells: <b>{viewGridCells}</b>
@@ -663,21 +847,26 @@
             </small>
         </div>
 
+        <h4 class="settings-heading">Factor weights</h4>
         {#each params as p}
-            <div class="row">
-                <label>{p.label} ({p.weight}): <small>{p.desc}</small></label>
-                <input
-                    type="range"
-                    min="0"
-                    max="3"
-                    step="0.1"
-                    bind:value={p.weight}
-                    on:change={() => {
-                        recomputeWorldCellScores(params);
-                        scheduleHeatmapUpdate();
-                    }}
-                />
-            </div>
+            {#if isParamLayerEnabled(p.id, layerOptions)}
+                <div class="row">
+                    <label>{p.label} ({p.weight}): <small>{p.desc}</small></label>
+                    <input
+                        type="range"
+                        min="0"
+                        max="3"
+                        step="0.1"
+                        bind:value={p.weight}
+                        on:change={() => {
+                            recomputeWorldCellScores(
+                                applyLayerOptionsToParams(params, layerOptions),
+                            );
+                            scheduleHeatmapUpdate();
+                        }}
+                    />
+                </div>
+            {/if}
         {/each}
 
         <p class="plugin-version">Version {pluginVersion}</p>
@@ -774,6 +963,15 @@
         padding: 15px;
         color: #fff;
         font-family: sans-serif;
+    }
+    .mobile-hint {
+        font-size: 12px;
+        line-height: 1.45;
+        margin: 0 0 10px;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: rgba(255, 193, 7, 0.18);
+        border: 1px solid rgba(255, 193, 7, 0.45);
     }
     .intro {
         font-size: 12px;
@@ -895,6 +1093,52 @@
         font-size: 12px;
         opacity: 0.85;
         margin: 0 0 10px;
+    }
+    .settings-heading {
+        margin: 14px 0 8px;
+        font-size: 12px;
+        font-weight: 700;
+    }
+    .layer-hint {
+        margin-bottom: 8px;
+    }
+    .layer-options {
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-bottom: 4px;
+    }
+    .layer-check {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+        font-size: 11px;
+        line-height: 1.35;
+        cursor: pointer;
+    }
+    .layer-check input {
+        margin-top: 2px;
+        flex-shrink: 0;
+    }
+    .layer-check__text {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .layer-check__text small {
+        opacity: 0.82;
+    }
+    .layer-slow-tag {
+        display: inline-block;
+        margin-left: 6px;
+        padding: 0 5px;
+        border-radius: 4px;
+        background: rgba(255, 180, 60, 0.25);
+        color: #ffd699;
+        font-size: 9px;
+        font-weight: 700;
+        text-transform: uppercase;
+        vertical-align: middle;
     }
     .resolution-hint {
         display: block;

@@ -18,6 +18,14 @@ import {
     setWorldCell,
     worldCellCacheContext,
 } from './bumpinessCellCache';
+import {
+    applyLayerOptionsToParams,
+    DEFAULT_LAYER_OPTIONS,
+    layerOptionsCacheKey,
+    maskInputsForLayers,
+    overlaysToSample,
+    type BumpinessLayerOptions,
+} from './bumpinessLayers';
 import { worldCellCenter, worldCellKey, type WorldGridSpec } from './bumpinessGrid';
 import {
     beginHiddenOverlaySampling,
@@ -26,7 +34,6 @@ import {
     getCachedOverlayValue,
     overlayCacheKey,
     setCachedOverlayValue,
-    THERMIC_OVERLAYS,
 } from './bumpinessOverlaySampling';
 
 import type { Overlays, Products } from '@windy/rootScope.d';
@@ -52,6 +59,7 @@ export type GridSampleOptions = {
     /** Paint map from forecast-only data before overlay pass finishes. */
     onQuickReady?: (result: GridSampleResult) => void;
     forecastConcurrency?: number;
+    layerOptions?: BumpinessLayerOptions;
 };
 
 function cacheKey(model: Products, lat: number, lon: number, altitudeFeet: number): string {
@@ -173,7 +181,9 @@ function buildGridResult(
     params: BumpinessParam[],
     cols: number,
     rows: number,
+    layerOptions: BumpinessLayerOptions,
 ): GridSampleResult {
+    const effectiveParams = applyLayerOptionsToParams(params, layerOptions);
     const grid = new Float32Array(cols * rows);
     const cells: GridCellResult[] = [];
 
@@ -219,9 +229,9 @@ function buildGridResult(
 
     for (const bucket of buckets.values()) {
         const n = bucket.merged.length;
-        const inputs = averageBumpinessInputs(bucket.merged);
-        const hazardInputs = peakBumpinessInputs(bucket.merged);
-        const score = computeBumpiness(inputs, params);
+        const inputs = maskInputsForLayers(averageBumpinessInputs(bucket.merged), layerOptions);
+        const hazardInputs = maskInputsForLayers(peakBumpinessInputs(bucket.merged), layerOptions);
+        const score = computeBumpiness(inputs, effectiveParams);
         grid[bucket.row * cols + bucket.col] = score;
         cells.push({
             point: {
@@ -245,14 +255,19 @@ async function sampleThermicOverlaysHidden(
     model: Products,
     points: { lat: number; lon: number }[],
     concurrency: number,
+    overlays: Overlays[],
 ): Promise<{ capeValues: number[]; cclValues: number[] }> {
+    const capeValues = new Array<number>(points.length).fill(0);
+    const cclValues = new Array<number>(points.length).fill(0);
+    if (!overlays.length || !points.length) {
+        return { capeValues, cclValues };
+    }
+
     return runExclusiveOverlayTask(async () => {
         samplingWeatherOverlays++;
         beginHiddenOverlaySampling();
         try {
             const restoreOverlay = bumpinessDisplayOverlay();
-            const capeValues = new Array<number>(points.length).fill(0);
-            const cclValues = new Array<number>(points.length).fill(0);
 
             const missesByOverlay: Record<'cape' | 'ccl', number[]> = {
                 cape: [],
@@ -261,7 +276,7 @@ async function sampleThermicOverlaysHidden(
 
             for (let i = 0; i < points.length; i++) {
                 const { lat, lon } = points[i];
-                for (const overlay of THERMIC_OVERLAYS) {
+                for (const overlay of overlays) {
                     const key = overlayCacheKey(model, overlay, lat, lon);
                     const cached = getCachedOverlayValue(key);
                     if (cached !== undefined) {
@@ -276,7 +291,7 @@ async function sampleThermicOverlaysHidden(
                 }
             }
 
-            for (const overlay of THERMIC_OVERLAYS) {
+            for (const overlay of overlays) {
                 const missIndices = missesByOverlay[overlay];
                 if (!missIndices.length) {
                     continue;
@@ -366,6 +381,8 @@ export async function sampleBumpinessGrid(
     forecastConcurrency = 18,
     options?: GridSampleOptions,
 ): Promise<GridSampleResult> {
+    const layerOptions = options?.layerOptions ?? DEFAULT_LAYER_OPTIONS;
+    const overlays = overlaysToSample(layerOptions);
     if (!points.length) {
         return { scores: new Float32Array(0), cells: [], cols: 0, rows: 0 };
     }
@@ -397,24 +414,36 @@ export async function sampleBumpinessGrid(
         params,
         cols,
         rows,
+        layerOptions,
     );
     options?.onQuickReady?.(quick);
 
     let capeValues = zeroOverlays;
     let cclValues = zeroOverlays;
-    try {
-        const sampled = await withTimeout(
-            sampleThermicOverlaysHidden(model, basePoints, 22),
-            OVERLAY_SAMPLE_TIMEOUT_MS,
-            'Grid overlay',
-        );
-        capeValues = sampled.capeValues;
-        cclValues = sampled.cclValues;
-    } catch {
-        /* keep forecast-only scores */
+    if (overlays.length) {
+        try {
+            const sampled = await withTimeout(
+                sampleThermicOverlaysHidden(model, basePoints, 22, overlays),
+                OVERLAY_SAMPLE_TIMEOUT_MS,
+                'Grid overlay',
+            );
+            capeValues = sampled.capeValues;
+            cclValues = sampled.cclValues;
+        } catch {
+            /* keep forecast-only scores */
+        }
     }
 
-    return buildGridResult(points, forecastInputs, capeValues, cclValues, params, cols, rows);
+    return buildGridResult(
+        points,
+        forecastInputs,
+        capeValues,
+        cclValues,
+        params,
+        cols,
+        rows,
+        layerOptions,
+    );
 }
 
 function pointsForMissingWorldCells(points: GridPoint[]): GridPoint[] {
@@ -432,15 +461,18 @@ function storeWorldCellsFromResult(
     latStep: number,
     lonStep: number,
     params: BumpinessParam[],
+    layerOptions: BumpinessLayerOptions,
 ): void {
+    const effectiveParams = applyLayerOptionsToParams(params, layerOptions);
     for (const cell of result.cells) {
         const center = worldCellCenter(cell.point.latIdx, cell.point.lonIdx, latStep, lonStep);
+        const inputs = maskInputsForLayers(cell.inputs, layerOptions);
         setWorldCell({
             latIdx: cell.point.latIdx,
             lonIdx: cell.point.lonIdx,
             lat: center.lat,
             lon: center.lon,
-            score: computeBumpiness(cell.inputs, params),
+            score: computeBumpiness(inputs, effectiveParams),
             inputs: cell.inputs,
             hazardInputs: cell.hazardInputs,
         });
@@ -450,7 +482,9 @@ function storeWorldCellsFromResult(
 function assembleGridFromWorldCache(
     spec: WorldGridSpec,
     params: BumpinessParam[],
+    layerOptions: BumpinessLayerOptions,
 ): GridSampleResult {
+    const effectiveParams = applyLayerOptionsToParams(params, layerOptions);
     const { cols, rows, latStep, lonStep, south, west } = spec;
     const grid = new Float32Array(cols * rows);
     const cells: GridCellResult[] = [];
@@ -465,7 +499,10 @@ function assembleGridFromWorldCache(
             if (!cached) {
                 continue;
             }
-            const score = computeBumpiness(cached.inputs, params);
+            const score = computeBumpiness(
+                maskInputsForLayers(cached.inputs, layerOptions),
+                effectiveParams,
+            );
             grid[row * cols + col] = score;
             cells.push({
                 point: {
@@ -495,6 +532,7 @@ export async function sampleBumpinessGridCached(
     forecastConcurrency = 18,
     options?: GridSampleOptions,
 ): Promise<GridSampleResult> {
+    const layerOptions = options?.layerOptions ?? DEFAULT_LAYER_OPTIONS;
     const { points, latStep, lonStep, zoom, viewGridCellCount } = spec;
     if (!points.length) {
         return { scores: new Float32Array(0), cells: [], cols: 0, rows: 0 };
@@ -509,6 +547,7 @@ export async function sampleBumpinessGridCached(
             lonStep,
             zoom,
             viewGridCellCount,
+            layerOptionsCacheKey(layerOptions),
         ),
     );
 
@@ -523,19 +562,28 @@ export async function sampleBumpinessGridCached(
             forecastConcurrency,
             options?.onQuickReady
                 ? {
+                      layerOptions,
                       onQuickReady: quick => {
-                          storeWorldCellsFromResult(quick, latStep, lonStep, params);
-                          options.onQuickReady?.(assembleGridFromWorldCache(spec, params));
+                          storeWorldCellsFromResult(
+                              quick,
+                              latStep,
+                              lonStep,
+                              params,
+                              layerOptions,
+                          );
+                          options.onQuickReady?.(
+                              assembleGridFromWorldCache(spec, params, layerOptions),
+                          );
                       },
                   }
-                : undefined,
+                : { layerOptions },
         );
-        storeWorldCellsFromResult(sampled, latStep, lonStep, params);
+        storeWorldCellsFromResult(sampled, latStep, lonStep, params, layerOptions);
     } else if (options?.onQuickReady) {
-        options.onQuickReady(assembleGridFromWorldCache(spec, params));
+        options.onQuickReady(assembleGridFromWorldCache(spec, params, layerOptions));
     }
 
-    return assembleGridFromWorldCache(spec, params);
+    return assembleGridFromWorldCache(spec, params, layerOptions);
 }
 
 export async function fetchPointBumpinessInputs(
@@ -544,23 +592,32 @@ export async function fetchPointBumpinessInputs(
     lon: number,
     altitudeFeet: number,
     pluginName: string,
-    options?: { useOverlays?: boolean },
+    options?: { useOverlays?: boolean; layerOptions?: BumpinessLayerOptions },
 ): Promise<BumpinessInputs> {
+    const layerOptions = options?.layerOptions ?? DEFAULT_LAYER_OPTIONS;
     const base = await fetchForecastInputs(model, lat, lon, altitudeFeet, pluginName);
 
     if (options?.useOverlays === false) {
-        return { ...base };
+        return maskInputsForLayers({ ...base }, layerOptions);
+    }
+
+    const overlays = overlaysToSample(layerOptions);
+    if (!overlays.length) {
+        return maskInputsForLayers({ ...base }, layerOptions);
     }
 
     const point = [{ lat, lon }];
     try {
         const { capeValues, cclValues } = await withTimeout(
-            sampleThermicOverlaysHidden(model, point, 1),
+            sampleThermicOverlaysHidden(model, point, 1, overlays),
             POINT_OVERLAY_TIMEOUT_MS,
             'Point overlay',
         );
-        return mergeOverlayIntoInputs(base, capeValues[0] ?? 0, cclValues[0] ?? 0);
+        return maskInputsForLayers(
+            mergeOverlayIntoInputs(base, capeValues[0] ?? 0, cclValues[0] ?? 0),
+            layerOptions,
+        );
     } catch {
-        return { ...base };
+        return maskInputsForLayers({ ...base }, layerOptions);
     }
 }
