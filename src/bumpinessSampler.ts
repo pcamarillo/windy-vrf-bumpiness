@@ -3,7 +3,9 @@ import { getLatLonInterpolator } from '@windy/interpolator';
 import store from '@windy/store';
 
 import {
+    averageBumpinessInputs,
     computeBumpiness,
+    peakBumpinessInputs,
     extractInputsFromForecast,
     getForecastDataHash,
     normalizeProduct,
@@ -166,17 +168,53 @@ function buildGridResult(
     rows: number,
 ): GridSampleResult {
     const grid = new Float32Array(cols * rows);
-    const cells: { point: GridPoint; inputs: BumpinessInputs }[] = [];
+    const cells: {
+        point: GridPoint;
+        inputs: BumpinessInputs;
+        hazardInputs: BumpinessInputs;
+    }[] = [];
+
+    const buckets = new Map<
+        string,
+        { col: number; row: number; latSum: number; lonSum: number; merged: BumpinessInputs[] }
+    >();
 
     for (let i = 0; i < points.length; i++) {
-        const inputs = mergeOverlayIntoInputs(
+        const p = points[i];
+        const key = `${p.col},${p.row}`;
+        const merged = mergeOverlayIntoInputs(
             forecastInputs[i],
             capeValues[i] ?? 0,
             cclValues[i] ?? 0,
         );
+
+        let bucket = buckets.get(key);
+        if (!bucket) {
+            bucket = { col: p.col, row: p.row, latSum: 0, lonSum: 0, merged: [] };
+            buckets.set(key, bucket);
+        }
+        bucket.latSum += p.lat;
+        bucket.lonSum += p.lon;
+        bucket.merged.push(merged);
+    }
+
+    for (const bucket of buckets.values()) {
+        const n = bucket.merged.length;
+        const inputs = averageBumpinessInputs(bucket.merged);
+        const hazardInputs = peakBumpinessInputs(bucket.merged);
         const score = computeBumpiness(inputs, params);
-        grid[points[i].row * cols + points[i].col] = score;
-        cells.push({ point: points[i], inputs });
+        grid[bucket.row * cols + bucket.col] = score;
+        cells.push({
+            point: {
+                lat: bucket.latSum / n,
+                lon: bucket.lonSum / n,
+                col: bucket.col,
+                row: bucket.row,
+                sub: 0,
+            },
+            inputs,
+            hazardInputs,
+        });
     }
 
     return { scores: grid, cells, cols, rows };
@@ -278,6 +316,8 @@ export type GridPoint = {
     lon: number;
     col: number;
     row: number;
+    /** 0 = centre; 1–2 = offset samples averaged into the cell. */
+    sub: number;
 };
 
 export type GridSampleResult = {

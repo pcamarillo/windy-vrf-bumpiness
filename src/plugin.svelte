@@ -23,8 +23,20 @@
         ensureBumpinessPane,
         raiseBumpinessOverlay,
     } from './bumpinessCanvas';
-    import { buildWorldAlignedGrid, gridViewKey } from './bumpinessGrid';
-    import { HazardSymbolLayer } from './bumpinessMarkers';
+    import {
+        approximateCellSideKm,
+        buildWorldAlignedGrid,
+        countGridCells,
+        cellDegFromKm,
+        DEFAULT_GRID_CELL_KM,
+        GRID_CELL_KM_MAX,
+        GRID_CELL_KM_MIN,
+        GRID_CELL_KM_STEP,
+        gridViewKey,
+        SAMPLES_PER_CELL,
+    } from './bumpinessGrid';
+    import { HazardSymbolLayer, type GridCellSample } from './bumpinessMarkers';
+    import { BumpinessPickerPin } from './bumpinessPickerPin';
     import { enterBumpinessMapMode, restoreBumpinessMapMode } from './bumpinessMapMode';
     import { forceEndHiddenOverlaySampling } from './bumpinessOverlaySampling';
     import {
@@ -41,6 +53,7 @@
 
     const title = 'VFR Bumpiness Analysis';
     const pluginName = config.name;
+    const pluginVersion = config.version;
 
     let altitudeFeet = 3000;
     let bumpiness = 0;
@@ -63,6 +76,10 @@
 
     let params: BumpinessParam[] = DEFAULT_BUMPINESS_PARAMS.map(p => ({ ...p }));
 
+    let gridCellKm = DEFAULT_GRID_CELL_KM;
+    $: gridCellDeg = cellDegFromKm(gridCellKm);
+    let estimatedCellCount = 0;
+
     let heatmapOverlay: L.ImageOverlay | null = null;
     let heatmapTimer: ReturnType<typeof setTimeout> | null = null;
     let heatmapToken = 0;
@@ -74,7 +91,10 @@
     let suppressMapRefresh = 0;
     let lastHeatmapViewKey = '';
     let lastPickerKey = '';
+    let lastHeatmapCells: GridCellSample[] = [];
+    let mapCellBumpiness: number | null = null;
     const symbolLayer = new HazardSymbolLayer();
+    const pickerPin = new BumpinessPickerPin();
     const legend = getBumpinessLegend();
     const POINT_ANALYSIS_TIMEOUT_MS = 12000;
 
@@ -84,14 +104,70 @@
 
     function applyBumpiness(inputs: BumpinessInputs) {
         data = inputs;
+        mapCellBumpiness = nearestGridBumpiness(lastLocation?.lat, lastLocation?.lon);
+        if (lastLocation) {
+            const score = computeBumpiness(inputs, params);
+            pickerPin.update(lastLocation.lat, lastLocation.lon, score);
+        }
+    }
+
+    function nearestGridBumpiness(lat?: number, lon?: number): number | null {
+        if (lat === undefined || lon === undefined || !lastHeatmapCells.length) {
+            return null;
+        }
+        let best: number | null = null;
+        let bestDist = Infinity;
+        for (const { point, inputs } of lastHeatmapCells) {
+            const dLat = point.lat - lat;
+            const dLon = point.lon - lon;
+            const dist = dLat * dLat + dLon * dLon;
+            if (dist < bestDist) {
+                bestDist = dist;
+                best = computeBumpiness(inputs, params);
+            }
+        }
+        const matchRadius = gridCellDeg * 0.85;
+        if (bestDist > matchRadius * matchRadius) {
+            return null;
+        }
+        return best;
+    }
+
+    function mapCenterLat(): number {
+        try {
+            return map.getCenter().lat;
+        } catch {
+            return lastLocation?.lat ?? 40;
+        }
+    }
+
+    function refreshResolutionEstimate() {
+        try {
+            const bounds = map.getBounds();
+            const spec = buildWorldAlignedGrid(
+                bounds.getSouth(),
+                bounds.getWest(),
+                bounds.getNorth(),
+                bounds.getEast(),
+                gridCellDeg,
+            );
+            estimatedCellCount = countGridCells(spec.points);
+        } catch {
+            estimatedCellCount = 0;
+        }
+    }
+
+    function onResolutionChanged() {
+        clearForecastCache();
+        lastHeatmapViewKey = '';
+        refreshResolutionEstimate();
+        scheduleHeatmapUpdate();
     }
 
     async function analyzePoint(lat: number, lon: number, updateHeatmap = true) {
         const token = ++analysisToken;
         lastLocation = { lat, lon };
         status = 'Loading forecast…';
-
-        const useOverlays = !heatmapBusy && !isSamplingWeatherOverlays();
 
         try {
             const inputs = await withTimeout(
@@ -101,7 +177,7 @@
                     lon,
                     altitudeFeet,
                     pluginName,
-                    { useOverlays },
+                    { useOverlays: true },
                 ),
                 POINT_ANALYSIS_TIMEOUT_MS,
                 'Point forecast',
@@ -122,6 +198,8 @@
             }
             console.error(error);
             applyBumpiness({
+                surfaceWindKt: 0,
+                gustKt: 0,
                 deltaV: 0,
                 shear: 0,
                 cape: 0,
@@ -129,6 +207,7 @@
                 vvel: 0,
                 rainMm: 0,
                 convPrecip: 0,
+                isDay: 1,
             });
             status =
                 error instanceof Error && error.message.includes('timed out')
@@ -144,11 +223,13 @@
             bounds.getWest(),
             bounds.getNorth(),
             bounds.getEast(),
+            gridCellDeg,
         );
         return gridViewKey(
             normalizeProduct(selectedModel),
             altitudeFeet,
             store.get('timestamp'),
+            gridCellDeg,
             spec,
         );
     }
@@ -167,6 +248,7 @@
     }
 
     function onMapViewChanged() {
+        refreshResolutionEstimate();
         if (heatmapBusy || isSamplingWeatherOverlays() || suppressMapRefresh > 0) {
             return;
         }
@@ -221,14 +303,18 @@
         const pane = ensureBumpinessPane(map);
         removeHeatmapOverlay();
         heatmapOverlay = L.imageOverlay(dataUrl, leafletBounds, {
-            opacity: 0.95,
+            opacity: 0.72,
             interactive: false,
             className: 'vfr-bumpiness-overlay',
             pane,
         });
         heatmapOverlay.addTo(map);
         raiseBumpinessOverlay(heatmapOverlay, map);
+        lastHeatmapCells = sample.cells;
         symbolLayer.render(sample.cells, params, altitudeFeet);
+        if (lastLocation) {
+            mapCellBumpiness = nearestGridBumpiness(lastLocation.lat, lastLocation.lon);
+        }
 
         const wheelZoom = map.scrollWheelZoom;
         if (wheelZoom && typeof wheelZoom.enable === 'function' && !wheelZoom.enabled()) {
@@ -255,9 +341,10 @@
             const west = bounds.getWest();
             const north = bounds.getNorth();
             const east = bounds.getEast();
-            const gridSpec = buildWorldAlignedGrid(south, west, north, east);
+            const gridSpec = buildWorldAlignedGrid(south, west, north, east, gridCellDeg);
             gridCols = gridSpec.cols;
             gridRows = gridSpec.rows;
+            estimatedCellCount = countGridCells(gridSpec.points);
 
             const sample = await sampleBumpinessGrid(
                 model,
@@ -322,6 +409,7 @@
         enterBumpinessMapMode(normalizeProduct(selectedModel));
         ensureBumpinessPane(map);
         syncAltitudeLevel();
+        refreshResolutionEstimate();
         const loc = store.get('pickerLocation');
         if (loc) {
             lastPickerKey = locationKey(loc.lat, loc.lon);
@@ -333,6 +421,7 @@
 
     export const onclose = () => {
         removeHeatmapOverlay();
+        pickerPin.clear();
         forceEndHiddenOverlaySampling();
         restoreBumpinessMapMode();
     };
@@ -341,6 +430,7 @@
         enterBumpinessMapMode(normalizeProduct(selectedModel));
         ensureBumpinessPane(map);
         syncAltitudeLevel();
+        refreshResolutionEstimate();
 
         const pickerSubId = store.on('pickerLocation', loc => {
             if (loc) {
@@ -379,6 +469,7 @@
             clearTimeout(heatmapTimer);
         }
         removeHeatmapOverlay();
+        pickerPin.clear();
         clearForecastCache();
         restoreBumpinessMapMode();
     });
@@ -396,18 +487,19 @@
     $: bumpiness = computeBumpiness(data, params);
     $: subscores = factorSubscores(data);
     $: hazardDetail = getHazardCauseDetail(data, params, altitudeFeet);
+    $: cellSideKm = approximateCellSideKm(gridCellDeg, mapCenterLat());
 </script>
 
 <div class="plugin__content">
     <h3>{title}</h3>
 
     <p class="intro">
-        Plugin para detectar <b>bumpiness (turbulencia percibida)</b> en vuelo
-        <b>VFR</b> con aviación ligera (ULM / GA). Combina rachas, cizalladura,
-        CAPE, capa CCL/Térmicas de Windy, lluvia y turbulencia a la altitud seleccionada.
+        Detects <b>bumpiness (perceived turbulence)</b> for <b>VFR</b> light aircraft
+        (ULM / GA). Combines gusts, wind shear, CAPE, Windy CCL/thermals layer, rain,
+        and model turbulence at the selected altitude.
     </p>
 
-    <label>Altitud (ft): <b>{altitudeFeet}</b></label>
+    <label>Altitude (ft): <b>{altitudeFeet}</b></label>
     <input
         type="range"
         min="1000"
@@ -418,33 +510,41 @@
     />
 
     <div class="meter" style="background-color: {bumpinessColor(bumpiness)}">
-        Bumpiness: {bumpiness.toFixed(1)}/10
+        Bumpiness (point): {bumpiness.toFixed(1)}/10
+        {#if mapCellBumpiness !== null}
+            <div class="meter-map-cell">
+                Nearest grid centre: {mapCellBumpiness.toFixed(1)}/10
+                {#if Math.abs(mapCellBumpiness - bumpiness) >= 0.6}
+                    <span> — can differ from click (CAPE/CCL sampled ~{cellSideKm} km away)</span>
+                {/if}
+            </div>
+        {/if}
         {#if hazardDetail.primary}
             <div class="meter-cause">{HAZARD_CAUSE_LABELS[hazardDetail.primary]}</div>
         {/if}
         {#if hazardDetail.secondary}
             <div class="meter-cause meter-cause--secondary">
-                También: {HAZARD_CAUSE_LABELS[hazardDetail.secondary]}
+                Also: {HAZARD_CAUSE_LABELS[hazardDetail.secondary]}
             </div>
         {/if}
     </div>
 
     <div class="breakdown">
         <div>
-            Viento: {data.surfaceWindKt.toFixed(0)} kt · Racha: {data.gustKt.toFixed(0)} kt
-            <span>(Δ {data.deltaV.toFixed(0)} kt, peso {Math.round(subscores.deltaV * 100)}%)</span>
+            Wind: {data.surfaceWindKt.toFixed(0)} kt · Gust: {data.gustKt.toFixed(0)} kt
+            <span>(Δ {data.deltaV.toFixed(0)} kt, weight {Math.round(subscores.deltaV * 100)}%)</span>
         </div>
         <div>Shear: {(data.shear).toFixed(0)} kt <span>({Math.round(subscores.shear * 100)}%)</span></div>
         <div>CAPE: {(data.cape).toFixed(0)} J/kg <span>({Math.round(subscores.cape * 100)}%)</span></div>
-        <div>CCL/Térmicas: {(data.cclM).toFixed(0)} m <span>({Math.round(subscores.cclM * 100)}%)</span></div>
-        <div>Lluvia: {(data.rainMm).toFixed(1)} mm/h</div>
+        <div>CCL/Thermals: {(data.cclM).toFixed(0)} m <span>({Math.round(subscores.cclM * 100)}%)</span></div>
+        <div>Rain: {(data.rainMm).toFixed(1)} mm/h</div>
         <div>Turb: {(data.vvel).toFixed(1)} <span>({Math.round(subscores.vvel * 100)}%)</span></div>
     </div>
 
     <p class="status">{status}</p>
 
     <section class="legend">
-        <h4>Leyenda — colores (bumpiness ≥ 2/10)</h4>
+        <h4>Legend — colors (bumpiness ≥ 2/10)</h4>
         <ul class="legend-colors">
             {#each legend as item}
                 <li>
@@ -453,32 +553,59 @@
                 </li>
             {/each}
         </ul>
-        <h4>Símbolos en mapa</h4>
+        <h4>Map symbols</h4>
         <ul class="legend-symbols">
             <li><span class="sym-preview sym-preview--thermic">SS</span> {HAZARD_CAUSE_LABELS.thermic}</li>
             <li><span class="sym-preview sym-preview--convective">⛈</span> {HAZARD_CAUSE_LABELS.convective}</li>
             <li><span class="sym-preview sym-preview--orographic">⛰</span> {HAZARD_CAUSE_LABELS.orographic}</li>
         </ul>
         <p class="legend-note">
-            SS con CCL/Térmicas (o CAPE) y sin lluvia. ⛈ convección húmeda con precipitación.
+            Each cell averages <b>{SAMPLES_PER_CELL} samples</b> (centre + offsets inside the cell). Map colours use a
+            <b>mild contrast stretch</b>; the panel shows the <b>exact click</b> forecast.
+        </p>
+        <p class="legend-note">
+            Symbols use <b>peak</b> rain/CAPE inside each cell (no SS in storms). ⛈ and ⛰ at local maxima.
         </p>
     </section>
 
     <details>
-        <summary>⚙️ Configuración</summary>
+        <summary>⚙️ Settings</summary>
 
         <p class="hint">
-            Base: capa de lluvia (u otra con línea temporal) para poder avanzar días.
-            Encima: tinte bumpiness y símbolos. Al cerrar el plugin se restaura tu vista.
+            Base layer: rain (or another timeline-capable overlay) so you can scrub the forecast.
+            On top: bumpiness tint and hazard symbols. Closing the plugin restores your previous view.
         </p>
 
         <div class="row">
-            <label>Modelo Meteorológico:</label>
+            <label>Weather model:</label>
             <select bind:value={selectedModel} on:change={onModelChanged}>
                 {#each models as m}
                     <option value={m}>{m.toUpperCase()}</option>
                 {/each}
             </select>
+        </div>
+
+        <div class="row">
+            <label>
+                Resolution: <b>{gridCellKm} km</b>
+                <small>({gridCellDeg.toFixed(2)}°)</small>
+                <small
+                    >~{cellSideKm} km/cell at map centre · ~{estimatedCellCount || '…'} cells
+                    ({SAMPLES_PER_CELL}× samples each)</small
+                >
+            </label>
+            <input
+                type="range"
+                min={GRID_CELL_KM_MIN}
+                max={GRID_CELL_KM_MAX}
+                step={GRID_CELL_KM_STEP}
+                bind:value={gridCellKm}
+                on:input={onResolutionChanged}
+            />
+            <small class="resolution-hint">
+                {GRID_CELL_KM_MIN} km = finer map (slower) · {GRID_CELL_KM_MAX} km = coarser (faster). Default
+                {DEFAULT_GRID_CELL_KM} km (0.20°).
+            </small>
         </div>
 
         {#each params as p}
@@ -497,6 +624,8 @@
                 />
             </div>
         {/each}
+
+        <p class="plugin-version">Version {pluginVersion}</p>
     </details>
 </div>
 
@@ -513,8 +642,46 @@
         visibility: hidden !important;
     }
     :global(body.vfr-bumpiness-hide-weather #map-container .leaflet-pane[name='bumpinessPane']),
+    :global(body.vfr-bumpiness-hide-weather #map-container .leaflet-pane[name='bumpinessSymbolsPane']),
+    :global(body.vfr-bumpiness-hide-weather #map-container .leaflet-pane[name='bumpinessPickerPane']),
     :global(body.vfr-bumpiness-hide-weather #map-container .vfr-bumpiness-overlay) {
         visibility: visible !important;
+    }
+    :global(.vfr-bump-pin-wrap) {
+        background: transparent;
+        border: none;
+    }
+    :global(.vfr-bump-pin) {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.45));
+    }
+    :global(.vfr-bump-pin__badge) {
+        min-width: 36px;
+        padding: 4px 8px;
+        border-radius: 8px;
+        border: 2px solid rgba(255, 255, 255, 0.95);
+        color: #111;
+        font-size: 14px;
+        font-weight: 800;
+        line-height: 1.1;
+        text-align: center;
+        white-space: nowrap;
+    }
+    :global(.vfr-bump-pin__tail) {
+        width: 0;
+        height: 0;
+        margin-top: -1px;
+        border-left: 7px solid transparent;
+        border-right: 7px solid transparent;
+        border-top: 10px solid rgba(255, 255, 255, 0.95);
+    }
+    :global(.leaflet-pane[name='bumpinessSymbolsPane']) {
+        z-index: 725 !important;
+    }
+    :global(.leaflet-pane[name='bumpinessPickerPane']) {
+        z-index: 735 !important;
     }
     :global(.vfr-hazard-marker) {
         background: transparent;
@@ -645,6 +812,12 @@
         font-weight: 500;
         opacity: 0.85;
     }
+    .meter-map-cell {
+        font-size: 10px;
+        font-weight: 600;
+        margin-top: 6px;
+        opacity: 0.92;
+    }
     .breakdown {
         font-size: 11px;
         opacity: 0.9;
@@ -658,6 +831,19 @@
         font-size: 12px;
         opacity: 0.85;
         margin: 0 0 10px;
+    }
+    .resolution-hint {
+        display: block;
+        font-size: 10px;
+        opacity: 0.7;
+        line-height: 1.35;
+        margin-top: 4px;
+    }
+    .plugin-version {
+        font-size: 10px;
+        opacity: 0.65;
+        margin: 12px 0 4px;
+        text-align: center;
     }
     .hint {
         font-size: 11px;

@@ -1,37 +1,21 @@
-import { bumpinessMapPixel } from './bumpiness';
+import { bumpinessMapPixel, MAP_DISPLAY_MIN_SCORE, stretchGridScoresForMap } from './bumpiness';
 
 const CANVAS_SIZE = 768;
+const HEATMAP_BLUR_PX = 11;
 
-/** Above weather tiles; city labels (GridLayer) typically sit higher in the stack. */
+/** Heatmap tint layer. */
 export const BUMPINESS_MAP_PANE = 'bumpinessPane';
-const BUMPINESS_PANE_Z = '680';
+const BUMPINESS_MAP_Z = '680';
 
-function bilinearSample(
-    grid: Float32Array,
-    gridW: number,
-    gridH: number,
-    gx: number,
-    gy: number,
-): number {
-    const x0 = Math.floor(gx);
-    const y0 = Math.floor(gy);
-    const x1 = Math.min(x0 + 1, gridW - 1);
-    const y1 = Math.min(y0 + 1, gridH - 1);
-    const tx = gx - x0;
-    const ty = gy - y0;
+/** SS / ⛈ / ⛰ markers — above heatmap. */
+export const BUMPINESS_SYMBOLS_PANE = 'bumpinessSymbolsPane';
+const BUMPINESS_SYMBOLS_Z = '725';
 
-    const v00 = grid[y0 * gridW + x0];
-    const v10 = grid[y0 * gridW + x1];
-    const v01 = grid[y1 * gridW + x0];
-    const v11 = grid[y1 * gridW + x1];
+/** Analyzed-point pin — above hazard symbols. */
+export const BUMPINESS_PICKER_PANE = 'bumpinessPickerPane';
+const BUMPINESS_PICKER_Z = '735';
 
-    const top = v00 * (1 - tx) + v10 * tx;
-    const bottom = v01 * (1 - tx) + v11 * tx;
-    return top * (1 - ty) + bottom * ty;
-}
-
-export function ensureBumpinessPane(map: L.Map): string {
-    const name = BUMPINESS_MAP_PANE;
+function ensurePane(map: L.Map, name: string, zIndex: string): HTMLElement {
     let pane = map.getPane(name);
     if (!pane) {
         pane = map.createPane(name);
@@ -40,12 +24,28 @@ export function ensureBumpinessPane(map: L.Map): string {
     if (mapPane && pane.parentElement !== mapPane) {
         mapPane.appendChild(pane);
     }
-    pane.style.zIndex = BUMPINESS_PANE_Z;
-    return name;
+    pane.style.zIndex = zIndex;
+    return pane;
+}
+
+export function ensureBumpinessPane(map: L.Map): string {
+    ensurePane(map, BUMPINESS_MAP_PANE, BUMPINESS_MAP_Z);
+    return BUMPINESS_MAP_PANE;
+}
+
+export function ensureBumpinessSymbolsPane(map: L.Map): string {
+    ensurePane(map, BUMPINESS_SYMBOLS_PANE, BUMPINESS_SYMBOLS_Z);
+    return BUMPINESS_SYMBOLS_PANE;
+}
+
+export function ensureBumpinessPickerPane(map: L.Map): string {
+    ensurePane(map, BUMPINESS_PICKER_PANE, BUMPINESS_PICKER_Z);
+    return BUMPINESS_PICKER_PANE;
 }
 
 /**
- * Smooth hazard field: transparent where calm, colored only above MAP_DISPLAY_MIN_SCORE.
+ * Soft hazard field: radial discs per cell (smooth edges), then light blur so
+ * neighbouring colours blend instead of hard squares.
  */
 export function buildSmoothHeatmapDataUrl(
     scores: Float32Array,
@@ -60,25 +60,52 @@ export function buildSmoothHeatmapDataUrl(
         return '';
     }
 
-    const imageData = ctx.createImageData(CANVAS_SIZE, CANVAS_SIZE);
-    const pixels = imageData.data;
+    const displayScores = stretchGridScoresForMap(scores);
+    const cellW = CANVAS_SIZE / gridW;
+    const cellH = CANVAS_SIZE / gridH;
+    const radius = Math.max(cellW, cellH) * 0.95;
 
-    for (let py = 0; py < CANVAS_SIZE; py++) {
-        const gy = (py / (CANVAS_SIZE - 1)) * (gridH - 1);
-        for (let px = 0; px < CANVAS_SIZE; px++) {
-            const gx = (px / (CANVAS_SIZE - 1)) * (gridW - 1);
-            const score = bilinearSample(scores, gridW, gridH, gx, gy);
+    for (let row = 0; row < gridH; row++) {
+        for (let col = 0; col < gridW; col++) {
+            const score = displayScores[row * gridW + col];
+            if (score < MAP_DISPLAY_MIN_SCORE) {
+                continue;
+            }
+
+            const cx = (col + 0.5) * cellW;
+            const cy = (row + 0.5) * cellH;
             const [r, g, b, a] = bumpinessMapPixel(score);
-            const i = (py * CANVAS_SIZE + px) * 4;
-            pixels[i] = r;
-            pixels[i + 1] = g;
-            pixels[i + 2] = b;
-            pixels[i + 3] = a;
+            if (a <= 0) {
+                continue;
+            }
+
+            const alpha = a / 255;
+            const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+            grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+            grad.addColorStop(0.45, `rgba(${r},${g},${b},${alpha * 0.5})`);
+            grad.addColorStop(0.78, `rgba(${r},${g},${b},${alpha * 0.15})`);
+            grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+
+            ctx.fillStyle = grad;
+            ctx.beginPath();
+            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+            ctx.fill();
         }
     }
 
-    ctx.putImageData(imageData, 0, 0);
-    return canvas.toDataURL('image/png');
+    const blurred = document.createElement('canvas');
+    blurred.width = CANVAS_SIZE;
+    blurred.height = CANVAS_SIZE;
+    const bctx = blurred.getContext('2d');
+    if (!bctx) {
+        return canvas.toDataURL('image/png');
+    }
+
+    bctx.filter = `blur(${HEATMAP_BLUR_PX}px)`;
+    bctx.drawImage(canvas, 0, 0);
+    bctx.filter = 'none';
+
+    return blurred.toDataURL('image/png');
 }
 
 export function gridSizeForZoom(zoom: number): { cols: number; rows: number } {
@@ -134,7 +161,7 @@ export function raiseBumpinessOverlay(overlay: L.ImageOverlay, map: L.Map): void
     }
     const el = overlay.getElement();
     if (el) {
-        el.style.zIndex = BUMPINESS_PANE_Z;
+        el.style.zIndex = BUMPINESS_MAP_Z;
     }
     const pane = map.getPane(BUMPINESS_MAP_PANE);
     if (pane?.parentElement) {
