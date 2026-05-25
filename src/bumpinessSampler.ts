@@ -13,6 +13,13 @@ import {
     type BumpinessParam,
 } from './bumpiness';
 import {
+    ensureWorldCellCacheContext,
+    getWorldCell,
+    setWorldCell,
+    worldCellCacheContext,
+} from './bumpinessCellCache';
+import { worldCellCenter, worldCellKey, type WorldGridSpec } from './bumpinessGrid';
+import {
     beginHiddenOverlaySampling,
     clearOverlayValueCache,
     endHiddenOverlaySampling,
@@ -168,20 +175,24 @@ function buildGridResult(
     rows: number,
 ): GridSampleResult {
     const grid = new Float32Array(cols * rows);
-    const cells: {
-        point: GridPoint;
-        inputs: BumpinessInputs;
-        hazardInputs: BumpinessInputs;
-    }[] = [];
+    const cells: GridCellResult[] = [];
 
     const buckets = new Map<
         string,
-        { col: number; row: number; latSum: number; lonSum: number; merged: BumpinessInputs[] }
+        {
+            col: number;
+            row: number;
+            latIdx: number;
+            lonIdx: number;
+            latSum: number;
+            lonSum: number;
+            merged: BumpinessInputs[];
+        }
     >();
 
     for (let i = 0; i < points.length; i++) {
         const p = points[i];
-        const key = `${p.col},${p.row}`;
+        const key = worldCellKey(p.latIdx, p.lonIdx);
         const merged = mergeOverlayIntoInputs(
             forecastInputs[i],
             capeValues[i] ?? 0,
@@ -190,7 +201,15 @@ function buildGridResult(
 
         let bucket = buckets.get(key);
         if (!bucket) {
-            bucket = { col: p.col, row: p.row, latSum: 0, lonSum: 0, merged: [] };
+            bucket = {
+                col: p.col,
+                row: p.row,
+                latIdx: p.latIdx,
+                lonIdx: p.lonIdx,
+                latSum: 0,
+                lonSum: 0,
+                merged: [],
+            };
             buckets.set(key, bucket);
         }
         bucket.latSum += p.lat;
@@ -211,6 +230,8 @@ function buildGridResult(
                 col: bucket.col,
                 row: bucket.row,
                 sub: 0,
+                latIdx: bucket.latIdx,
+                lonIdx: bucket.lonIdx,
             },
             inputs,
             hazardInputs,
@@ -318,11 +339,20 @@ export type GridPoint = {
     row: number;
     /** 0 = centre; 1–2 = offset samples averaged into the cell. */
     sub: number;
+    /** Fixed world grid index (stable when panning). */
+    latIdx: number;
+    lonIdx: number;
+};
+
+export type GridCellResult = {
+    point: GridPoint;
+    inputs: BumpinessInputs;
+    hazardInputs: BumpinessInputs;
 };
 
 export type GridSampleResult = {
     scores: Float32Array;
-    cells: { point: GridPoint; inputs: BumpinessInputs }[];
+    cells: GridCellResult[];
     cols: number;
     rows: number;
 };
@@ -385,6 +415,127 @@ export async function sampleBumpinessGrid(
     }
 
     return buildGridResult(points, forecastInputs, capeValues, cclValues, params, cols, rows);
+}
+
+function pointsForMissingWorldCells(points: GridPoint[]): GridPoint[] {
+    const missingKeys = new Set<string>();
+    for (const p of points) {
+        if (!getWorldCell(p.latIdx, p.lonIdx)) {
+            missingKeys.add(worldCellKey(p.latIdx, p.lonIdx));
+        }
+    }
+    return points.filter(p => missingKeys.has(worldCellKey(p.latIdx, p.lonIdx)));
+}
+
+function storeWorldCellsFromResult(
+    result: GridSampleResult,
+    latStep: number,
+    lonStep: number,
+    params: BumpinessParam[],
+): void {
+    for (const cell of result.cells) {
+        const center = worldCellCenter(cell.point.latIdx, cell.point.lonIdx, latStep, lonStep);
+        setWorldCell({
+            latIdx: cell.point.latIdx,
+            lonIdx: cell.point.lonIdx,
+            lat: center.lat,
+            lon: center.lon,
+            score: computeBumpiness(cell.inputs, params),
+            inputs: cell.inputs,
+            hazardInputs: cell.hazardInputs,
+        });
+    }
+}
+
+function assembleGridFromWorldCache(
+    spec: WorldGridSpec,
+    params: BumpinessParam[],
+): GridSampleResult {
+    const { cols, rows, latStep, lonStep, south, west } = spec;
+    const grid = new Float32Array(cols * rows);
+    const cells: GridCellResult[] = [];
+
+    for (let row = 0; row < rows; row++) {
+        for (let col = 0; col < cols; col++) {
+            const centerLat = south + (row + 0.5) * latStep;
+            const centerLon = west + (col + 0.5) * lonStep;
+            const latIdx = Math.floor(centerLat / latStep);
+            const lonIdx = Math.floor(centerLon / lonStep);
+            const cached = getWorldCell(latIdx, lonIdx);
+            if (!cached) {
+                continue;
+            }
+            const score = computeBumpiness(cached.inputs, params);
+            grid[row * cols + col] = score;
+            cells.push({
+                point: {
+                    lat: centerLat,
+                    lon: centerLon,
+                    col,
+                    row,
+                    sub: 0,
+                    latIdx,
+                    lonIdx,
+                },
+                inputs: cached.inputs,
+                hazardInputs: cached.hazardInputs,
+            });
+        }
+    }
+
+    return { scores: grid, cells, cols, rows };
+}
+
+export async function sampleBumpinessGridCached(
+    model: Products,
+    altitudeFeet: number,
+    pluginName: string,
+    spec: WorldGridSpec,
+    params: BumpinessParam[],
+    forecastConcurrency = 18,
+    options?: GridSampleOptions,
+): Promise<GridSampleResult> {
+    const { points, latStep, lonStep, zoom, viewGridCellCount } = spec;
+    if (!points.length) {
+        return { scores: new Float32Array(0), cells: [], cols: 0, rows: 0 };
+    }
+
+    ensureWorldCellCacheContext(
+        worldCellCacheContext(
+            model,
+            store.get('timestamp'),
+            altitudeFeet,
+            latStep,
+            lonStep,
+            zoom,
+            viewGridCellCount,
+        ),
+    );
+
+    const missingPoints = pointsForMissingWorldCells(points);
+    if (missingPoints.length) {
+        const sampled = await sampleBumpinessGrid(
+            model,
+            altitudeFeet,
+            pluginName,
+            missingPoints,
+            params,
+            forecastConcurrency,
+            options?.onQuickReady
+                ? {
+                      onQuickReady: quick => {
+                          storeWorldCellsFromResult(quick, latStep, lonStep, params);
+                          options.onQuickReady?.(assembleGridFromWorldCache(spec, params));
+                      },
+                  }
+                : undefined,
+        );
+        storeWorldCellsFromResult(sampled, latStep, lonStep, params);
+    } else if (options?.onQuickReady) {
+        options.onQuickReady(assembleGridFromWorldCache(spec, params));
+    }
+
+    return assembleGridFromWorldCache(spec, params);
 }
 
 export async function fetchPointBumpinessInputs(

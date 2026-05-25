@@ -50,25 +50,25 @@ type CellMetrics = {
     thermicS: number;
 };
 
-function cellKey(col: number, row: number): string {
-    return `${col},${row}`;
+function cellKey(latIdx: number, lonIdx: number): string {
+    return `${latIdx},${lonIdx}`;
 }
 
 function isLocalPeak(
     metrics: Map<string, CellMetrics>,
-    col: number,
-    row: number,
+    latIdx: number,
+    lonIdx: number,
     value: number,
     compare: (m: CellMetrics) => number,
 ): boolean {
     const neighbors = [
-        [col, row - 1],
-        [col, row + 1],
-        [col - 1, row],
-        [col + 1, row],
+        [latIdx, lonIdx - 1],
+        [latIdx, lonIdx + 1],
+        [latIdx - 1, lonIdx],
+        [latIdx + 1, lonIdx],
     ];
-    for (const [c, r] of neighbors) {
-        const n = metrics.get(cellKey(c, r));
+    for (const [li, lj] of neighbors) {
+        const n = metrics.get(cellKey(li, lj));
         if (n && compare(n) > value * 1.03) {
             return false;
         }
@@ -114,7 +114,7 @@ export function collectSymbolCells(
             continue;
         }
 
-        metrics.set(cellKey(cell.point.col, cell.point.row), {
+        metrics.set(cellKey(cell.point.latIdx, cell.point.lonIdx), {
             cell,
             cause,
             bump,
@@ -133,8 +133,8 @@ export function collectSymbolCells(
             if (
                 !isLocalPeak(
                     metrics,
-                    m.cell.point.col,
-                    m.cell.point.row,
+                    m.cell.point.latIdx,
+                    m.cell.point.lonIdx,
                     m.thermicS,
                     n => n.thermicS,
                 )
@@ -147,7 +147,13 @@ export function collectSymbolCells(
                 continue;
             }
             if (
-                !isLocalPeak(metrics, m.cell.point.col, m.cell.point.row, m.bump, n => n.bump)
+                !isLocalPeak(
+                    metrics,
+                    m.cell.point.latIdx,
+                    m.cell.point.lonIdx,
+                    m.bump,
+                    n => n.bump,
+                )
             ) {
                 continue;
             }

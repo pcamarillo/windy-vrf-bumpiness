@@ -24,16 +24,21 @@
         raiseBumpinessOverlay,
     } from './bumpinessCanvas';
     import {
+        clearWorldCellCache,
+        getWorldCell,
+        recomputeWorldCellScores,
+    } from './bumpinessCellCache';
+    import {
         approximateCellSideKm,
-        buildWorldAlignedGrid,
-        countGridCells,
-        cellDegFromKm,
-        DEFAULT_GRID_CELL_KM,
-        GRID_CELL_KM_MAX,
-        GRID_CELL_KM_MIN,
-        GRID_CELL_KM_STEP,
+        buildViewFixedGrid,
+        DEFAULT_VIEW_GRID_CELLS,
         gridViewKey,
+        latLonToWorldCellIndex,
         SAMPLES_PER_CELL,
+        VIEW_GRID_CELLS_MAX,
+        VIEW_GRID_CELLS_MIN,
+        VIEW_GRID_CELLS_STEP,
+        type WorldGridSpec,
     } from './bumpinessGrid';
     import { HazardSymbolLayer, type GridCellSample } from './bumpinessMarkers';
     import { BumpinessPickerPin } from './bumpinessPickerPin';
@@ -43,7 +48,7 @@
         clearForecastCache,
         fetchPointBumpinessInputs,
         isSamplingWeatherOverlays,
-        sampleBumpinessGrid,
+        sampleBumpinessGridCached,
         withTimeout,
         type GridSampleResult,
     } from './bumpinessSampler';
@@ -76,9 +81,15 @@
 
     let params: BumpinessParam[] = DEFAULT_BUMPINESS_PARAMS.map(p => ({ ...p }));
 
-    let gridCellKm = DEFAULT_GRID_CELL_KM;
-    $: gridCellDeg = cellDegFromKm(gridCellKm);
-    let estimatedCellCount = 0;
+    let viewGridCells = DEFAULT_VIEW_GRID_CELLS;
+    let resolvedGridCols = 0;
+    let resolvedGridRows = 0;
+    let activeLatStep = 0;
+    let activeLonStep = 0;
+    let displayCellKm = 0;
+    let displayLatStep = 0;
+    let displayLonStep = 0;
+    let estimatedCellCount = viewGridCells;
 
     let heatmapOverlay: L.ImageOverlay | null = null;
     let heatmapTimer: ReturnType<typeof setTimeout> | null = null;
@@ -111,8 +122,44 @@
         }
     }
 
+    function buildGridSpecFromMap(): WorldGridSpec {
+        const bounds = map.getBounds();
+        return buildViewFixedGrid(
+            bounds.getSouth(),
+            bounds.getWest(),
+            bounds.getNorth(),
+            bounds.getEast(),
+            viewGridCells,
+            map.getZoom(),
+        );
+    }
+
+    function applyGridSpecMetrics(spec: WorldGridSpec): void {
+        resolvedGridCols = spec.viewGridCols;
+        resolvedGridRows = spec.viewGridRows;
+        estimatedCellCount = resolvedGridCols * resolvedGridRows;
+        displayCellKm = approximateCellSideKm(spec.latStep, spec.lonStep, mapCenterLat());
+        displayLatStep = spec.latStep;
+        displayLonStep = spec.lonStep;
+    }
+
     function nearestGridBumpiness(lat?: number, lon?: number): number | null {
-        if (lat === undefined || lon === undefined || !lastHeatmapCells.length) {
+        if (lat === undefined || lon === undefined) {
+            return null;
+        }
+        if (activeLatStep > 0 && activeLonStep > 0) {
+            const { latIdx, lonIdx } = latLonToWorldCellIndex(
+                lat,
+                lon,
+                activeLatStep,
+                activeLonStep,
+            );
+            const cached = getWorldCell(latIdx, lonIdx);
+            if (cached) {
+                return computeBumpiness(cached.inputs, params);
+            }
+        }
+        if (!lastHeatmapCells.length) {
             return null;
         }
         let best: number | null = null;
@@ -126,7 +173,9 @@
                 best = computeBumpiness(inputs, params);
             }
         }
-        const matchRadius = gridCellDeg * 0.85;
+        const matchLat = activeLatStep > 0 ? activeLatStep : displayLatStep;
+        const matchLon = activeLonStep > 0 ? activeLonStep : displayLonStep;
+        const matchRadius = Math.min(matchLat, matchLon) * 0.85;
         if (bestDist > matchRadius * matchRadius) {
             return null;
         }
@@ -143,22 +192,21 @@
 
     function refreshResolutionEstimate() {
         try {
-            const bounds = map.getBounds();
-            const spec = buildWorldAlignedGrid(
-                bounds.getSouth(),
-                bounds.getWest(),
-                bounds.getNorth(),
-                bounds.getEast(),
-                gridCellDeg,
-            );
-            estimatedCellCount = countGridCells(spec.points);
+            const spec = buildGridSpecFromMap();
+            applyGridSpecMetrics(spec);
         } catch {
-            estimatedCellCount = 0;
+            estimatedCellCount = viewGridCells;
+            resolvedGridCols = 0;
+            resolvedGridRows = 0;
+            displayCellKm = 0;
+            displayLatStep = 0;
+            displayLonStep = 0;
         }
     }
 
-    function onResolutionChanged() {
+    function onGridConfigChanged() {
         clearForecastCache();
+        clearWorldCellCache();
         lastHeatmapViewKey = '';
         refreshResolutionEstimate();
         scheduleHeatmapUpdate();
@@ -217,19 +265,11 @@
     }
 
     function viewKeyForHeatmap(): string {
-        const bounds = map.getBounds();
-        const spec = buildWorldAlignedGrid(
-            bounds.getSouth(),
-            bounds.getWest(),
-            bounds.getNorth(),
-            bounds.getEast(),
-            gridCellDeg,
-        );
+        const spec = buildGridSpecFromMap();
         return gridViewKey(
             normalizeProduct(selectedModel),
             altitudeFeet,
             store.get('timestamp'),
-            gridCellDeg,
             spec,
         );
     }
@@ -265,6 +305,7 @@
 
     function onModelChanged() {
         clearForecastCache();
+        clearWorldCellCache();
         lastHeatmapViewKey = '';
         store.set('product', normalizeProduct(selectedModel));
         if (lastLocation) {
@@ -282,14 +323,24 @@
         }
     }
 
-    function paintHeatmapSample(
-        sample: GridSampleResult,
-        gridSpec: ReturnType<typeof buildWorldAlignedGrid>,
-    ): boolean {
+    function paintHeatmapSample(sample: GridSampleResult, gridSpec: WorldGridSpec): boolean {
+        activeLatStep = gridSpec.latStep;
+        activeLonStep = gridSpec.lonStep;
+        applyGridSpecMetrics(gridSpec);
+
+        const paintCells = sample.cells.map(cell => ({
+            lat: cell.point.lat,
+            lon: cell.point.lon,
+            score: computeBumpiness(cell.inputs, params),
+        }));
         const dataUrl = buildSmoothHeatmapDataUrl(
-            sample.scores,
-            sample.cols,
-            sample.rows,
+            paintCells,
+            gridSpec.south,
+            gridSpec.west,
+            gridSpec.north,
+            gridSpec.east,
+            gridSpec.latStep,
+            gridSpec.lonStep,
         );
         if (!dataUrl) {
             return false;
@@ -336,21 +387,15 @@
         status = 'Loading bumpiness (wind & shear)…';
 
         try {
-            const bounds = map.getBounds();
-            const south = bounds.getSouth();
-            const west = bounds.getWest();
-            const north = bounds.getNorth();
-            const east = bounds.getEast();
-            const gridSpec = buildWorldAlignedGrid(south, west, north, east, gridCellDeg);
+            const gridSpec = buildGridSpecFromMap();
             gridCols = gridSpec.cols;
             gridRows = gridSpec.rows;
-            estimatedCellCount = countGridCells(gridSpec.points);
 
-            const sample = await sampleBumpinessGrid(
+            const sample = await sampleBumpinessGridCached(
                 model,
                 altitudeFeet,
                 pluginName,
-                gridSpec.points,
+                gridSpec,
                 params,
                 18,
                 {
@@ -440,6 +485,7 @@
 
         const timestampSubId = store.on('timestamp', () => {
             clearForecastCache();
+            clearWorldCellCache();
             lastHeatmapViewKey = '';
             if (lastLocation) {
                 void analyzePoint(lastLocation.lat, lastLocation.lon, false);
@@ -471,12 +517,14 @@
         removeHeatmapOverlay();
         pickerPin.clear();
         clearForecastCache();
+        clearWorldCellCache();
         restoreBumpinessMapMode();
     });
 
     function onAltitudeChanged() {
         syncAltitudeLevel();
         clearForecastCache();
+        clearWorldCellCache();
         if (lastLocation) {
             void analyzePoint(lastLocation.lat, lastLocation.lon);
         } else {
@@ -487,7 +535,6 @@
     $: bumpiness = computeBumpiness(data, params);
     $: subscores = factorSubscores(data);
     $: hazardDetail = getHazardCauseDetail(data, params, altitudeFeet);
-    $: cellSideKm = approximateCellSideKm(gridCellDeg, mapCenterLat());
 </script>
 
 <div class="plugin__content">
@@ -497,6 +544,15 @@
         Detects <b>bumpiness (perceived turbulence)</b> for <b>VFR</b> light aircraft
         (ULM / GA). Combines gusts, wind shear, CAPE, Windy CCL/thermals layer, rain,
         and model turbulence at the selected altitude.
+    </p>
+    <p class="grid-info">
+        Map grid: <b>{resolvedGridCols || '…'}×{resolvedGridRows || '…'}</b>
+        ({estimatedCellCount || viewGridCells} cells). At this zoom each cell ≈
+        <b>{displayCellKm || '…'} km</b>
+        {#if displayLatStep > 0}
+            ({displayLatStep.toFixed(2)}° × {displayLonStep.toFixed(2)}°)
+        {/if}
+        — zoom in for finer resolution.
     </p>
 
     <label>Altitude (ft): <b>{altitudeFeet}</b></label>
@@ -515,7 +571,7 @@
             <div class="meter-map-cell">
                 Nearest grid centre: {mapCellBumpiness.toFixed(1)}/10
                 {#if Math.abs(mapCellBumpiness - bumpiness) >= 0.6}
-                    <span> — can differ from click (CAPE/CCL sampled ~{cellSideKm} km away)</span>
+                    <span> — can differ from click (grid cell ~{displayCellKm || '…'} km at this zoom)</span>
                 {/if}
             </div>
         {/if}
@@ -560,8 +616,8 @@
             <li><span class="sym-preview sym-preview--orographic">⛰</span> {HAZARD_CAUSE_LABELS.orographic}</li>
         </ul>
         <p class="legend-note">
-            Each cell averages <b>{SAMPLES_PER_CELL} samples</b> (centre + offsets inside the cell). Map colours use a
-            <b>mild contrast stretch</b>; the panel shows the <b>exact click</b> forecast.
+            Target <b>{viewGridCells}</b> cells → {resolvedGridCols}×{resolvedGridRows} from screen shape; size
+            adapts to zoom (~{displayCellKm || '…'} km now). Colours stay stable when panning. Panel = exact click.
         </p>
         <p class="legend-note">
             Symbols use <b>peak</b> rain/CAPE inside each cell (no SS in storms). ⛈ and ⛰ at local maxima.
@@ -587,24 +643,23 @@
 
         <div class="row">
             <label>
-                Resolution: <b>{gridCellKm} km</b>
-                <small>({gridCellDeg.toFixed(2)}°)</small>
+                Grid cells: <b>{viewGridCells}</b>
                 <small
-                    >~{cellSideKm} km/cell at map centre · ~{estimatedCellCount || '…'} cells
-                    ({SAMPLES_PER_CELL}× samples each)</small
+                    >→ {resolvedGridCols || '…'}×{resolvedGridRows || '…'} on screen · ~{displayCellKm ||
+                        '…'} km/cell at this zoom</small
                 >
             </label>
             <input
                 type="range"
-                min={GRID_CELL_KM_MIN}
-                max={GRID_CELL_KM_MAX}
-                step={GRID_CELL_KM_STEP}
-                bind:value={gridCellKm}
-                on:input={onResolutionChanged}
+                min={VIEW_GRID_CELLS_MIN}
+                max={VIEW_GRID_CELLS_MAX}
+                step={VIEW_GRID_CELLS_STEP}
+                bind:value={viewGridCells}
+                on:input={onGridConfigChanged}
             />
             <small class="resolution-hint">
-                {GRID_CELL_KM_MIN} km = finer map (slower) · {GRID_CELL_KM_MAX} km = coarser (faster). Default
-                {DEFAULT_GRID_CELL_KM} km (0.20°).
+                Total cells ({VIEW_GRID_CELLS_MIN}–{VIEW_GRID_CELLS_MAX}). Rows/columns follow the map aspect
+                ratio. More cells = finer detail (slower); zoom in to shrink each cell.
             </small>
         </div>
 
@@ -618,7 +673,7 @@
                     step="0.1"
                     bind:value={p.weight}
                     on:change={() => {
-                        clearForecastCache();
+                        recomputeWorldCellScores(params);
                         scheduleHeatmapUpdate();
                     }}
                 />
@@ -724,7 +779,16 @@
         font-size: 12px;
         line-height: 1.45;
         opacity: 0.9;
+        margin: 0 0 8px;
+    }
+    .grid-info {
+        font-size: 11px;
+        line-height: 1.4;
+        opacity: 0.85;
         margin: 0 0 12px;
+        padding: 8px 10px;
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 6px;
     }
     .legend {
         font-size: 11px;

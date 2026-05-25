@@ -1,7 +1,13 @@
-import { bumpinessMapPixel, MAP_DISPLAY_MIN_SCORE, stretchGridScoresForMap } from './bumpiness';
+import { bumpinessMapPixel, MAP_DISPLAY_MIN_SCORE } from './bumpiness';
 
 const CANVAS_SIZE = 768;
 const HEATMAP_BLUR_PX = 11;
+
+export type HeatmapPaintCell = {
+    lat: number;
+    lon: number;
+    score: number;
+};
 
 /** Heatmap tint layer. */
 export const BUMPINESS_MAP_PANE = 'bumpinessPane';
@@ -44,53 +50,62 @@ export function ensureBumpinessPickerPane(map: L.Map): string {
 }
 
 /**
- * Soft hazard field: radial discs per cell (smooth edges), then light blur so
- * neighbouring colours blend instead of hard squares.
+ * Soft hazard field painted at fixed geographic cell centres (stable when panning),
+ * then light blur so neighbouring colours blend.
  */
 export function buildSmoothHeatmapDataUrl(
-    scores: Float32Array,
-    gridW: number,
-    gridH: number,
+    cells: HeatmapPaintCell[],
+    south: number,
+    west: number,
+    north: number,
+    east: number,
+    latStep: number,
+    lonStep: number,
 ): string {
     const canvas = document.createElement('canvas');
     canvas.width = CANVAS_SIZE;
     canvas.height = CANVAS_SIZE;
     const ctx = canvas.getContext('2d');
-    if (!ctx) {
+    if (!ctx || !cells.length) {
         return '';
     }
 
-    const displayScores = stretchGridScoresForMap(scores);
-    const cellW = CANVAS_SIZE / gridW;
-    const cellH = CANVAS_SIZE / gridH;
-    const radius = Math.max(cellW, cellH) * 0.95;
+    const latSpan = north - south;
+    const lonSpan = east - west;
+    if (latSpan <= 0 || lonSpan <= 0) {
+        return '';
+    }
 
-    for (let row = 0; row < gridH; row++) {
-        for (let col = 0; col < gridW; col++) {
-            const score = displayScores[row * gridW + col];
-            if (score < MAP_DISPLAY_MIN_SCORE) {
-                continue;
-            }
+    const pxLat = (latStep / latSpan) * CANVAS_SIZE;
+    const pxLon = (lonStep / lonSpan) * CANVAS_SIZE;
+    const radius = Math.max(pxLat, pxLon) * 0.95;
 
-            const cx = (col + 0.5) * cellW;
-            const cy = (row + 0.5) * cellH;
-            const [r, g, b, a] = bumpinessMapPixel(score);
-            if (a <= 0) {
-                continue;
-            }
+    const toX = (lon: number) => ((lon - west) / lonSpan) * CANVAS_SIZE;
+    const toY = (lat: number) => ((north - lat) / latSpan) * CANVAS_SIZE;
 
-            const alpha = a / 255;
-            const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
-            grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
-            grad.addColorStop(0.45, `rgba(${r},${g},${b},${alpha * 0.5})`);
-            grad.addColorStop(0.78, `rgba(${r},${g},${b},${alpha * 0.15})`);
-            grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
-
-            ctx.fillStyle = grad;
-            ctx.beginPath();
-            ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-            ctx.fill();
+    for (const { lat, lon, score } of cells) {
+        if (score < MAP_DISPLAY_MIN_SCORE) {
+            continue;
         }
+
+        const cx = toX(lon);
+        const cy = toY(lat);
+        const [r, g, b, a] = bumpinessMapPixel(score);
+        if (a <= 0) {
+            continue;
+        }
+
+        const alpha = a / 255;
+        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, radius);
+        grad.addColorStop(0, `rgba(${r},${g},${b},${alpha})`);
+        grad.addColorStop(0.45, `rgba(${r},${g},${b},${alpha * 0.5})`);
+        grad.addColorStop(0.78, `rgba(${r},${g},${b},${alpha * 0.15})`);
+        grad.addColorStop(1, `rgba(${r},${g},${b},0)`);
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+        ctx.fill();
     }
 
     const blurred = document.createElement('canvas');
